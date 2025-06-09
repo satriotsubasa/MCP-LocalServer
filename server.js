@@ -918,46 +918,71 @@ app.post('/search', async (req, res) => {
                 searchResult = await performAdvancedSearch(filters || { anywhere: query }, null, limit);
                 break;
             case 'batch':
-                // For batch, create multiple searches from the query
-                const searches = [
-                    { type: 'keywords', query: query, searchIn: 'anywhere', limit: Math.floor(limit/3) },
-                    { type: 'title', query: query, limit: Math.floor(limit/3) },
-                    { type: 'keywords', query: query, searchIn: 'body', limit: Math.floor(limit/3) }
+                // Simplified batch search - just do multiple keyword searches
+                console.log('🔍 Performing batch search with multiple strategies...');
+                const batchSearches = [
+                    await performKeywordSearch(query, 'anywhere', Math.floor(limit/3)),
+                    await performTitleSearch(query, Math.floor(limit/3)),
+                    await performKeywordSearch(query, 'body', Math.floor(limit/3))
                 ];
-                const batchResult = await performBatchSearch(searches);
-                // Flatten batch results for unified response
+                
+                // Combine and deduplicate results
+                const allResults = [];
+                const seenIds = new Set();
+                
+                batchSearches.forEach(result => {
+                    result.results.forEach(doc => {
+                        if (!seenIds.has(doc.id)) {
+                            seenIds.add(doc.id);
+                            allResults.push(doc);
+                        }
+                    });
+                });
+                
                 searchResult = {
                     searchTerm: query,
-                    results: batchResult.results.flatMap(r => r.success ? r.results : []),
-                    total: batchResult.results.reduce((sum, r) => sum + (r.success ? r.results.length : 0), 0)
+                    results: allResults.slice(0, limit), // Limit total results
+                    total: allResults.length
                 };
                 break;
             default:
                 throw new Error(`Unknown search type: ${search_type}`);
         }
 
-        // Transform results to OpenAI format
-        const transformedResults = searchResult.results.map(doc => ({
-            id: doc.id,
-            title: doc.name || doc.id,
-            summary: `${doc.workspace_name || 'Unknown workspace'} - ${doc.custom1_description || ''} ${doc.custom2_description || ''} - ${doc.type_description || doc.type || 'Unknown type'} (${formatFileSize(doc.size || 0)})`.trim(),
-            url: doc.iwl || null,
-            metadata: {
-                author: doc.author_description || doc.author || 'Unknown',
-                workspace: doc.workspace_name || 'Unknown',
-                size: (doc.size || 0).toString(),
-                edit_date: doc.edit_date || 'Unknown',
-                document_type: doc.type_description || doc.type || 'Unknown',
-                custom1: doc.custom1_description || '',
-                custom2: doc.custom2_description || '',
-                custom3: doc.custom3_description || ''
-            }
-        }));
+        // Transform results to OpenAI format with size limits
+        const transformedResults = searchResult.results.map(doc => {
+            const size = doc.size || 0;
+            const sizeStr = formatFileSize(size);
+            
+            // Mark large documents in summary
+            const isLarge = size > 1000000; // 1MB threshold
+            const sizeWarning = isLarge ? " [LARGE FILE - May exceed processing limits]" : "";
+            
+            return {
+                id: doc.id,
+                title: doc.name || doc.id,
+                summary: `${doc.workspace_name || 'Unknown workspace'} - ${doc.custom1_description || ''} ${doc.custom2_description || ''} - ${doc.type_description || doc.type || 'Unknown type'} (${sizeStr})${sizeWarning}`.trim(),
+                url: doc.iwl || null,
+                metadata: {
+                    author: doc.author_description || doc.author || 'Unknown',
+                    workspace: doc.workspace_name || 'Unknown',
+                    size: size.toString(),
+                    size_formatted: sizeStr,
+                    is_large_file: isLarge,
+                    edit_date: doc.edit_date || 'Unknown',
+                    document_type: doc.type_description || doc.type || 'Unknown',
+                    custom1: doc.custom1_description || '',
+                    custom2: doc.custom2_description || '',
+                    custom3: doc.custom3_description || ''
+                }
+            };
+        });
 
         res.status(200).json({
             results: transformedResults,
             total: searchResult.total || transformedResults.length,
-            search_type: search_type
+            search_type: search_type,
+            query: query
         });
 
     } catch (error) {
@@ -983,7 +1008,7 @@ app.post('/fetch', async (req, res) => {
         
         const accessToken = await getAccessToken();
         
-        // Get document details
+        // Get document details first
         const detailsUrl = `${process.env.URL_PREFIX}/api/v2/customers/${process.env.CUSTOMER_ID}/libraries/${process.env.LIBRARY_ID}/documents/${id}`;
         const detailsResponse = await axios.get(detailsUrl, {
             headers: { 'X-Auth-Token': accessToken },
@@ -992,21 +1017,54 @@ app.post('/fetch', async (req, res) => {
 
         const doc = detailsResponse.data.data;
         let content = '';
+        let contentWarning = '';
 
         if (include_content) {
-            // Download document content
-            const downloadUrl = `${process.env.URL_PREFIX}/api/v2/customers/${process.env.CUSTOMER_ID}/libraries/${process.env.LIBRARY_ID}/documents/${id}/download`;
-            const downloadResponse = await axios.get(downloadUrl, {
-                headers: { 'X-Auth-Token': accessToken },
-                responseType: 'arraybuffer',
-                httpsAgent
-            });
+            const docSize = doc.size || 0;
+            
+            // Check if document is too large for ChatGPT processing
+            if (docSize > 2000000) { // 2MB limit
+                contentWarning = `Document is ${formatFileSize(docSize)} which may be too large for analysis. Consider requesting smaller documents or specific sections.`;
+                content = `[LARGE DOCUMENT WARNING] This document (${formatFileSize(docSize)}) exceeds recommended size limits for content analysis. Document metadata is provided below, but full content analysis may not be feasible.`;
+            } else if (docSize > 500000) { // 500KB warning
+                contentWarning = `Document is ${formatFileSize(docSize)} - processing may be slow.`;
+                
+                try {
+                    // Download document content
+                    const downloadUrl = `${process.env.URL_PREFIX}/api/v2/customers/${process.env.CUSTOMER_ID}/libraries/${process.env.LIBRARY_ID}/documents/${id}/download`;
+                    const downloadResponse = await axios.get(downloadUrl, {
+                        headers: { 'X-Auth-Token': accessToken },
+                        responseType: 'arraybuffer',
+                        httpsAgent,
+                        timeout: 30000 // 30 second timeout for large files
+                    });
 
-            const buffer = Buffer.from(downloadResponse.data);
-            content = `Document content (${formatFileSize(buffer.length)} ${doc.type || 'file'}): ${buffer.toString('base64')}`;
+                    const buffer = Buffer.from(downloadResponse.data);
+                    content = `Document content (${formatFileSize(buffer.length)} ${doc.type || 'file'}): ${buffer.toString('base64')}`;
+                } catch (downloadError) {
+                    console.error('Download failed for large file:', downloadError.message);
+                    content = `[DOWNLOAD FAILED] Unable to download document content due to size (${formatFileSize(docSize)}) or timeout. Document metadata is available below.`;
+                }
+            } else {
+                // Small document - download normally
+                try {
+                    const downloadUrl = `${process.env.URL_PREFIX}/api/v2/customers/${process.env.CUSTOMER_ID}/libraries/${process.env.LIBRARY_ID}/documents/${id}/download`;
+                    const downloadResponse = await axios.get(downloadUrl, {
+                        headers: { 'X-Auth-Token': accessToken },
+                        responseType: 'arraybuffer',
+                        httpsAgent
+                    });
+
+                    const buffer = Buffer.from(downloadResponse.data);
+                    content = `Document content (${formatFileSize(buffer.length)} ${doc.type || 'file'}): ${buffer.toString('base64')}`;
+                } catch (downloadError) {
+                    console.error('Download failed:', downloadError.message);
+                    content = `[DOWNLOAD FAILED] Unable to download document content. Error: ${downloadError.message}`;
+                }
+            }
         }
 
-        res.status(200).json({
+        const response = {
             id: doc.id,
             title: doc.name || doc.id,
             text: content,
@@ -1017,6 +1075,8 @@ app.post('/fetch', async (req, res) => {
                 workspace: doc.workspace_name || 'Unknown',
                 workspace_id: doc.workspace_id || '',
                 size: (doc.size || 0).toString(),
+                size_formatted: formatFileSize(doc.size || 0),
+                is_large_file: (doc.size || 0) > 1000000,
                 edit_date: doc.edit_date || 'Unknown',
                 create_date: doc.create_date || 'Unknown',
                 document_type: doc.type_description || doc.type || 'Unknown',
@@ -1028,9 +1088,12 @@ app.post('/fetch', async (req, res) => {
                 database: doc.database || '',
                 document_number: (doc.document_number || '').toString(),
                 last_user: doc.last_user_description || doc.last_user || '',
-                default_security: doc.default_security || 'private'
+                default_security: doc.default_security || 'private',
+                content_warning: contentWarning
             }
-        });
+        };
+
+        res.status(200).json(response);
 
         console.log('✅ Document fetched successfully for OpenAI Connector');
 
