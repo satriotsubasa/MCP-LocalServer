@@ -790,13 +790,15 @@ app.get('/health', (req, res) => {
 
 // OpenAI Connector Tool Discovery Endpoint (OpenAI Function Calling Format)
 app.get('/tools', (req, res) => {
-    // Ensure proper headers
+    // Ensure proper headers and clean response
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.status(200);
     
     res.json([
         {
             type: "function",
+            description: "Search for documents using various strategies and filters",
             function: {
                 name: "search",
                 description: "Search iManage documents using various strategies including title search, keyword search, advanced filters, and batch operations for comprehensive document discovery",
@@ -858,7 +860,8 @@ app.get('/tools', (req, res) => {
             }
         },
         {
-            type: "function", 
+            type: "function",
+            description: "Fetch document metadata and content by ID",
             function: {
                 name: "fetch",
                 description: "Retrieve detailed content and comprehensive metadata for a specific document identified by its ID, including document text content for analysis and research purposes",
@@ -942,7 +945,7 @@ app.post('/search', async (req, res) => {
             }
         }));
 
-        res.json({
+        res.status(200).json({
             results: transformedResults,
             total: searchResult.total || transformedResults.length,
             search_type: search_type
@@ -994,7 +997,7 @@ app.post('/fetch', async (req, res) => {
             content = `Document content (${formatFileSize(buffer.length)} ${doc.type || 'file'}): ${buffer.toString('base64')}`;
         }
 
-        res.json({
+        res.status(200).json({
             id: doc.id,
             title: doc.name || doc.id,
             text: content,
@@ -1130,4 +1133,19 @@ app.listen(PORT, () => {
     console.log(`🔍 Features: Title Search, Keyword Search, Advanced Search, Batch Operations`);
     console.log(`🌐 Environment: ${process.env.URL_PREFIX}`);
     console.log(`📁 Library: ${process.env.LIBRARY_ID}`);
+    
+    // Show deployment info
+    if (process.env.RENDER) {
+        console.log(`🚀 Deployed on Render`);
+        console.log(`🔗 Public URL: https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'your-app.onrender.com'}`);
+    } else {
+        console.log(`💻 Running locally`);
+    }
+    
+    console.log(`\n📡 Available endpoints:`);
+    console.log(`   GET  /health - Health check`);
+    console.log(`   GET  /tools - OpenAI tool discovery`);
+    console.log(`   POST /search - Unified search endpoint`);
+    console.log(`   POST /fetch - Document retrieval`);
+    console.log(`   GET  /.well-known/ai-plugin.json - OpenAI plugin manifest`);
 });
